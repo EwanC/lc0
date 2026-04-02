@@ -34,6 +34,7 @@
 #include <string>
 #include <thread>
 
+#define CL_ENABLE_BETA_EXTENSIONS
 #include "neural/backends/opencl/OpenCL.h"
 #include "neural/backends/opencl/OpenCLParams.h"
 #include "neural/backends/opencl/OpenCLTuner.h"
@@ -52,6 +53,8 @@ class OpenCLBuffers {
   void forward(const std::vector<net_t>& input, std::vector<net_t>& output_pol,
                std::vector<net_t>& output_val, std::vector<net_t>& output_mov,
                const int batch_size);
+
+  void finalizeGraph();
 
  private:
   using weight_slice_t = std::vector<cl::Buffer>::const_iterator;
@@ -83,6 +86,7 @@ class OpenCLBuffers {
   const OpenCL_Network& m_opencl_net;
   const OpenCL& m_opencl;
 
+  std::vector<cl::CommandBufferKhr> m_commandbuffers;
   cl::CommandQueue m_commandqueue;
   cl::Kernel m_convolve1_kernel;
   cl::Kernel m_merge_kernel;
@@ -105,4 +109,6 @@ class OpenCLBuffers {
   size_t m_finalSize_pol;
   size_t m_finalSize_val;
   size_t m_finalSize_mov;
+  bool m_enable_graph_capture;
+  bool m_graph_finalized{false};
 };

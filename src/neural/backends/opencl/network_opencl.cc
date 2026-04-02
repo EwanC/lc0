@@ -83,6 +83,34 @@ class OpenCLComputation : public NetworkComputation {
   // Adds a sample to the batch.
   void AddInput(InputPlanes&& input) override { planes_.emplace_back(input); }
 
+  void FinalizeGraph() { buffers_->finalizeGraph(); }
+
+  void CaptureGraph() {
+    const auto plane_count = planes_.size();
+    const auto max_batch_size = opencl_net_.getMaxMatchSize();
+    const auto largest_batch_size = std::min(max_batch_size, plane_count);
+
+    const auto num_output_policies = weights_.num_output_policies;
+    const auto num_value_channels = weights_.num_value_channels;
+    const auto num_moves_channels = weights_.num_moves_channels;
+
+    std::vector<float> output_pol(largest_batch_size * num_output_policies);
+    std::vector<float> output_val(largest_batch_size * num_value_channels);
+    std::vector<float> output_mov(largest_batch_size * num_moves_channels);
+    std::vector<float> input_data(largest_batch_size * kInputPlanes * kSquares);
+
+    for (size_t i = 0; i < plane_count; i += largest_batch_size) {
+      const auto batch_size = std::min(plane_count - i, largest_batch_size);
+
+      for (size_t j = 0; j < batch_size; j++) {
+        EncodePlanes(planes_[i + j], &input_data[j * kSquares * kInputPlanes]);
+      }
+
+      buffers_->forward(input_data, output_pol, output_val, output_mov,
+                        batch_size);
+    }
+  }
+
   // Do the computation.
   void ComputeBlocking() override {
     // Determine the largest batch for allocations.
@@ -247,6 +275,7 @@ class OpenCLNetwork : public Network {
     params_.tune_only = options.GetOrDefault<bool>("tune_only", false);
     params_.tune_exhaustive =
         options.GetOrDefault<bool>("tune_exhaustive", false);
+    params_.graph_capture = options.GetOrDefault<bool>("graph_capture", false);
     if (options.Exists<std::string>("tuner_file")) {
       params_.tuner_file = options.Get<std::string>("tuner_file");
     } else {
@@ -404,6 +433,15 @@ class OpenCLNetwork : public Network {
     }
 
     opencl_net_.setMaxMatchSize(max_batch_size_);
+
+    if (opencl_.graph_capture_enabled()) {
+      OpenCLComputation comp(opencl_net_, weights_, wdl_, moves_left_);
+      for (unsigned i = 0; i < max_batch_size_; i++) {
+        comp.AddInput(InputPlanes{(size_t)kInputPlanes});
+        comp.CaptureGraph();
+      }
+      comp.FinalizeGraph();
+    }
   }
 
   std::unique_ptr<NetworkComputation> NewComputation() override {

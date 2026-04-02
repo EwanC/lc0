@@ -128,6 +128,13 @@ OpenCLBuffers::OpenCLBuffers(const OpenCL_Network& opencl_net)
   m_pool_buffer =
       cl::Buffer(m_opencl.m_context, CL_MEM_READ_WRITE | CL_MEM_HOST_NO_ACCESS,
                  alloc_pool_size);
+
+  if (m_opencl.m_graph_capture_enabled) {
+    std::vector<cl::CommandQueue> queues{m_commandqueue};
+    for (unsigned i = 0; i < max_batch_size; i++) {
+      m_commandbuffers.emplace_back(queues);
+    }
+  }
 }
 
 void OpenCLBuffers::forward(const std::vector<net_t>& input,
@@ -140,155 +147,160 @@ void OpenCLBuffers::forward(const std::vector<net_t>& input,
   const auto inSize = sizeof(net_t) * input.size();
   m_commandqueue.enqueueWriteBuffer(m_inBuffer, CL_FALSE, 0, inSize,
                                     input.data());
+  if (m_graph_finalized) {
+    std::vector<cl::CommandQueue> queues{m_commandqueue};
+    auto& command_buffer = m_commandbuffers[batch_size - 1];
+    command_buffer.enqueueCommandBuffer({queues});
+  } else {
+    auto skip_in_trans = false;
+    for (auto iter = cbegin(layers); iter != cend(layers); iter++) {
+      const auto& layer = *iter;
+      const auto niter = std::next(iter);
 
-  auto skip_in_trans = false;
-  for (auto iter = cbegin(layers); iter != cend(layers); iter++) {
-    const auto& layer = *iter;
-    const auto niter = std::next(iter);
+      if (layer.is_input_convolution) {
+        assert(niter != cend(layers));
+        auto conv_weights = begin(layer.weights);
+        auto conv_biases = begin(layer.weights) + 1;
+        auto skip_next_in_trans = false;
+        if (niter->is_residual_block) {
+          skip_next_in_trans = true;
+        }
+        convolve3(layer.channels, layer.outputs, m_inBuffer, m_inBuffer,
+                  m_VBuffer, m_MBuffer, conv_weights, nullptr, conv_biases,
+                  skip_in_trans, skip_next_in_trans, true, true, batch_size);
+        skip_in_trans = skip_next_in_trans;
+      } else if (layer.is_residual_block) {
+        assert(layer.channels == layer.outputs);
+        assert(niter != cend(layers));
+        auto conv1_weights = begin(layer.weights);
+        auto conv1_biases = begin(layer.weights) + 1;
+        auto conv2_weights = begin(layer.weights) + 2;
+        auto conv2_biases = begin(layer.weights) + 3;
 
-    if (layer.is_input_convolution) {
-      assert(niter != cend(layers));
-      auto conv_weights = begin(layer.weights);
-      auto conv_biases = begin(layer.weights) + 1;
-      auto skip_next_in_trans = false;
-      if (niter->is_residual_block) {
-        skip_next_in_trans = true;
-      }
-      convolve3(layer.channels, layer.outputs, m_inBuffer, m_inBuffer,
-                m_VBuffer, m_MBuffer, conv_weights, nullptr, conv_biases,
-                skip_in_trans, skip_next_in_trans, true, true, batch_size);
-      skip_in_trans = skip_next_in_trans;
-    } else if (layer.is_residual_block) {
-      assert(layer.channels == layer.outputs);
-      assert(niter != cend(layers));
-      auto conv1_weights = begin(layer.weights);
-      auto conv1_biases = begin(layer.weights) + 1;
-      auto conv2_weights = begin(layer.weights) + 2;
-      auto conv2_biases = begin(layer.weights) + 3;
+        convolve3(layer.channels,  // channels
+                  layer.outputs,   // outputs
+                  m_inBuffer,      // bufferIn
+                  m_inBuffer2,     // bufferOut
+                  m_VBuffer,       // bufferV
+                  m_MBuffer,       // bufferM
+                  conv1_weights,   // weights
+                  nullptr,         // bufferResidual
+                  conv1_biases,    // biases
+                  skip_in_trans,   // skip_in_transform
+                  true,            // fuse_in_transform
+                  false,           // store_inout
+                  true,            // relu
+                  batch_size);     // batch_size
 
-      convolve3(layer.channels,  // channels
-                layer.outputs,   // outputs
-                m_inBuffer,      // bufferIn
-                m_inBuffer2,     // bufferOut
-                m_VBuffer,       // bufferV
-                m_MBuffer,       // bufferM
-                conv1_weights,   // weights
-                nullptr,         // bufferResidual
-                conv1_biases,    // biases
-                skip_in_trans,   // skip_in_transform
-                true,            // fuse_in_transform
-                false,           // store_inout
-                true,            // relu
-                batch_size);     // batch_size
+        auto skip_next_in_trans = false;
+        if (niter->is_residual_block) {
+          skip_next_in_trans = true;
+        }
+        auto relu = true;
+        auto residual = &m_inBuffer;
+        auto out_buffer = m_inBuffer;
+        auto store_inout = true;
+        if (niter->is_se_unit) {
+          // SE unit does relu
+          relu = false;
+          residual = nullptr;
+          out_buffer = m_inBuffer2;
+          store_inout = false;
+        }
+        convolve3(layer.channels,      // channels
+                  layer.outputs,       // outputs
+                  m_inBuffer2,         // bufferIn
+                  out_buffer,          // bufferOut
+                  m_VBuffer,           // bufferV
+                  m_MBuffer,           // bufferM
+                  conv2_weights,       // weights
+                  residual,            // bufferResidual
+                  conv2_biases,        // biases
+                  true,                // skip_in_transform
+                  skip_next_in_trans,  // fuse_in_transform
+                  store_inout,         // store_inout
+                  relu,                // relu
+                  batch_size);         // batch_size
+        skip_in_trans = skip_next_in_trans;
+      } else if (layer.is_se_unit) {
+        // inBuffer: residual connection from start of the residual block
+        // inBuffer2: Last block output
+        // Output will be written in inBuffer
+        assert(niter != cend(layers));
+        auto se_weights = begin(layer.weights);
+        squeeze_excitation(layer.outputs,        // channels
+                           layer.se_fc_outputs,  // fc_outputs
+                           m_inBuffer2,          // bufferIn
+                           m_pool_buffer,        // bufferTemp1
+                           m_MBuffer,            // bufferTemp2
+                           se_weights,           // weights
+                           m_inBuffer,           // residual
+                           batch_size);          // batch_size
+      } else if (layer.is_conv_policy) {
+        assert(niter != cend(layers));
+        auto conv1_weights = begin(layer.weights);
+        auto conv1_biases = begin(layer.weights) + 1;
+        auto conv2_weights = begin(layer.weights) + 2;
+        auto conv2_biases = begin(layer.weights) + 3;
+        auto indices = begin(layer.weights) + 4;
 
-      auto skip_next_in_trans = false;
-      if (niter->is_residual_block) {
-        skip_next_in_trans = true;
-      }
-      auto relu = true;
-      auto residual = &m_inBuffer;
-      auto out_buffer = m_inBuffer;
-      auto store_inout = true;
-      if (niter->is_se_unit) {
-        // SE unit does relu
-        relu = false;
-        residual = nullptr;
-        out_buffer = m_inBuffer2;
-        store_inout = false;
-      }
-      convolve3(layer.channels,      // channels
-                layer.outputs,       // outputs
-                m_inBuffer2,         // bufferIn
-                out_buffer,          // bufferOut
-                m_VBuffer,           // bufferV
-                m_MBuffer,           // bufferM
-                conv2_weights,       // weights
-                residual,            // bufferResidual
-                conv2_biases,        // biases
-                true,                // skip_in_transform
-                skip_next_in_trans,  // fuse_in_transform
-                store_inout,         // store_inout
-                relu,                // relu
-                batch_size);         // batch_size
-      skip_in_trans = skip_next_in_trans;
-    } else if (layer.is_se_unit) {
-      // inBuffer: residual connection from start of the residual block
-      // inBuffer2: Last block output
-      // Output will be written in inBuffer
-      assert(niter != cend(layers));
-      auto se_weights = begin(layer.weights);
-      squeeze_excitation(layer.outputs,        // channels
-                         layer.se_fc_outputs,  // fc_outputs
-                         m_inBuffer2,          // bufferIn
-                         m_pool_buffer,        // bufferTemp1
-                         m_MBuffer,            // bufferTemp2
-                         se_weights,           // weights
-                         m_inBuffer,           // residual
-                         batch_size);          // batch_size
-    } else if (layer.is_conv_policy) {
-      assert(niter != cend(layers));
-      auto conv1_weights = begin(layer.weights);
-      auto conv1_biases = begin(layer.weights) + 1;
-      auto conv2_weights = begin(layer.weights) + 2;
-      auto conv2_biases = begin(layer.weights) + 3;
-      auto indices = begin(layer.weights) + 4;
+        convolve3(layer.channels,  // channels
+                  layer.channels,  // outputs
+                  m_inBuffer,      // bufferIn
+                  m_inBuffer2,     // bufferOut
+                  m_VBuffer,       // bufferV
+                  m_MBuffer,       // bufferM
+                  conv1_weights,   // weights
+                  nullptr,         // bufferResidual
+                  conv1_biases,    // biases
+                  skip_in_trans,   // skip_in_transform
+                  true,            // fuse_in_transform
+                  false,           // store_inout
+                  true,            // relu
+                  batch_size);     // batch_size
 
-      convolve3(layer.channels,  // channels
-                layer.channels,  // outputs
-                m_inBuffer,      // bufferIn
-                m_inBuffer2,     // bufferOut
-                m_VBuffer,       // bufferV
-                m_MBuffer,       // bufferM
-                conv1_weights,   // weights
-                nullptr,         // bufferResidual
-                conv1_biases,    // biases
-                skip_in_trans,   // skip_in_transform
-                true,            // fuse_in_transform
-                false,           // store_inout
-                true,            // relu
-                batch_size);     // batch_size
+        // m_inBuffer needs to be preserved for value head
+        convolve3(layer.channels,  // channels
+                  layer.outputs,   // outputs
+                  m_inBuffer2,     // bufferIn
+                  m_inBuffer2,     // bufferOut
+                  m_VBuffer,       // bufferV
+                  m_MBuffer,       // bufferM
+                  conv2_weights,   // weights
+                  nullptr,         // bufferResidual
+                  conv2_biases,    // biases
+                  true,            // skip_in_transform
+                  false,           // fuse_in_transform
+                  false,           // store_inout
+                  false,           // relu
+                  batch_size);     // batch_size
 
-      // m_inBuffer needs to be preserved for value head
-      convolve3(layer.channels,  // channels
-                layer.outputs,   // outputs
-                m_inBuffer2,     // bufferIn
-                m_inBuffer2,     // bufferOut
-                m_VBuffer,       // bufferV
-                m_MBuffer,       // bufferM
-                conv2_weights,   // weights
-                nullptr,         // bufferResidual
-                conv2_biases,    // biases
-                true,            // skip_in_transform
-                false,           // fuse_in_transform
-                false,           // store_inout
-                false,           // relu
-                batch_size);     // batch_size
+        policymap(batch_size, m_inBuffer2, m_pinnedOutBuffer_pol, indices[0],
+                  layer.outputs * 8 * 8, layer.ip_in_size, layer.ip_out_size);
 
-      policymap(batch_size, m_inBuffer2, m_pinnedOutBuffer_pol, indices[0],
-                layer.outputs * 8 * 8, layer.ip_in_size, layer.ip_out_size);
-
-    } else {
-      assert(layer.is_value || layer.is_policy || layer.is_moves_left);
-
-      cl::Buffer out_buffer;
-      if (layer.is_policy) {
-        out_buffer = m_pinnedOutBuffer_pol;
-      } else if (layer.is_value) {
-        out_buffer = m_pinnedOutBuffer_val;
       } else {
-        out_buffer = m_pinnedOutBuffer_mov;
+        assert(layer.is_value || layer.is_policy || layer.is_moves_left);
+
+        cl::Buffer out_buffer;
+        if (layer.is_policy) {
+          out_buffer = m_pinnedOutBuffer_pol;
+        } else if (layer.is_value) {
+          out_buffer = m_pinnedOutBuffer_val;
+        } else {
+          out_buffer = m_pinnedOutBuffer_mov;
+        }
+
+        auto conv_weights = begin(layer.weights);
+        auto conv_biases = begin(layer.weights) + 1;
+        auto ip_w = begin(layer.weights) + 2;
+        auto ip_b = begin(layer.weights) + 3;
+
+        convolve1(layer.channels, layer.outputs, m_inBuffer, m_inBuffer2,
+                  m_VBuffer, conv_weights, conv_biases, batch_size);
+
+        innerproduct(m_inBuffer2, ip_w, ip_b, out_buffer, layer.ip_in_size,
+                     layer.ip_out_size, layer.is_value, batch_size);
       }
-
-      auto conv_weights = begin(layer.weights);
-      auto conv_biases = begin(layer.weights) + 1;
-      auto ip_w = begin(layer.weights) + 2;
-      auto ip_b = begin(layer.weights) + 3;
-
-      convolve1(layer.channels, layer.outputs, m_inBuffer, m_inBuffer2,
-                m_VBuffer, conv_weights, conv_biases, batch_size);
-
-      innerproduct(m_inBuffer2, ip_w, ip_b, out_buffer, layer.ip_in_size,
-                   layer.ip_out_size, layer.is_value, batch_size);
     }
   }
 
@@ -367,9 +379,16 @@ void OpenCLBuffers::convolve3(int channels, int outputs, cl::Buffer& bufferIn,
       m_in_transform_kernel.setArg(3, k_ceil);
       m_in_transform_kernel.setArg(4, n_ceil);
 
-      m_commandqueue.enqueueNDRangeKernel(
-          m_in_transform_kernel, cl::NullRange,
-          cl::NDRange(wgs, channels, batch_size));
+      if (m_opencl.m_graph_capture_enabled) {
+        auto& command_buffer = m_commandbuffers[batch_size - 1];
+        command_buffer.commandNDRangeKernel(
+            {}, m_in_transform_kernel, cl::NullRange,
+            cl::NDRange(wgs, channels, batch_size));
+      } else {
+        m_commandqueue.enqueueNDRangeKernel(
+            m_in_transform_kernel, cl::NullRange,
+            cl::NDRange(wgs, channels, batch_size));
+      }
     } catch (const cl::Error& e) {
       CERR << "Error in convolve3/in: " << e.what() << ": " << e.err()
            << std::endl;
@@ -390,8 +409,14 @@ void OpenCLBuffers::convolve3(int channels, int outputs, cl::Buffer& bufferIn,
     cl::NDRange size_sgemm = {(m_ceil * mdimc) / mwg, (n_ceil * ndimc) / nwg,
                               (cl::size_type)WINOGRAD_TILE};
 
-    m_commandqueue.enqueueNDRangeKernel(m_sgemm_kernel, cl::NullRange,
-                                        size_sgemm, local_sgemm);
+    if (m_opencl.m_graph_capture_enabled) {
+      auto& command_buffer = m_commandbuffers[batch_size - 1];
+      command_buffer.commandNDRangeKernel({}, m_sgemm_kernel, cl::NullRange,
+                                          size_sgemm, local_sgemm);
+    } else {
+      m_commandqueue.enqueueNDRangeKernel(m_sgemm_kernel, cl::NullRange,
+                                          size_sgemm, local_sgemm);
+    }
   } catch (const cl::Error& e) {
     CERR << "Error in convolve3/sgemm: " << e.what() << ": " << e.err()
          << std::endl;
@@ -426,9 +451,18 @@ void OpenCLBuffers::convolve3(int channels, int outputs, cl::Buffer& bufferIn,
       m_out_transform_bn_in_kernel.setArg(
           9, cl::Local(dim_size * width * height * sizeof(float)));
 
-      m_commandqueue.enqueueNDRangeKernel(
-          m_out_transform_bn_in_kernel, cl::NullRange,
-          cl::NDRange(outputs, wgs, batch_size), cl::NDRange(dim_size, wgs, 1));
+      if (m_opencl.m_graph_capture_enabled) {
+        auto& command_buffer = m_commandbuffers[batch_size - 1];
+        command_buffer.commandNDRangeKernel(
+            {}, m_out_transform_bn_in_kernel, cl::NullRange,
+            cl::NDRange(outputs, wgs, batch_size),
+            cl::NDRange(dim_size, wgs, 1));
+      } else {
+        m_commandqueue.enqueueNDRangeKernel(
+            m_out_transform_bn_in_kernel, cl::NullRange,
+            cl::NDRange(outputs, wgs, batch_size),
+            cl::NDRange(dim_size, wgs, 1));
+      }
     } else {
       m_out_transform_bn_kernel.setArg(0, bufferM);
       m_out_transform_bn_kernel.setArg(1, bufferOut);
@@ -443,9 +477,16 @@ void OpenCLBuffers::convolve3(int channels, int outputs, cl::Buffer& bufferIn,
       }
       m_out_transform_bn_kernel.setArg(7, biases[0]);
 
-      m_commandqueue.enqueueNDRangeKernel(
-          m_out_transform_bn_kernel, cl::NullRange,
-          cl::NDRange(outputs, wgs, batch_size));
+      if (m_opencl.m_graph_capture_enabled) {
+        auto& command_buffer = m_commandbuffers[batch_size - 1];
+        command_buffer.commandNDRangeKernel(
+            {}, m_out_transform_bn_kernel, cl::NullRange,
+            cl::NDRange(outputs, wgs, batch_size));
+      } else {
+        m_commandqueue.enqueueNDRangeKernel(
+            m_out_transform_bn_kernel, cl::NullRange,
+            cl::NDRange(outputs, wgs, batch_size));
+      }
     }
   } catch (const cl::Error& e) {
     CERR << "Error in convolve3/out: " << e.what() << ": " << e.err()
@@ -465,9 +506,16 @@ void OpenCLBuffers::squeeze_excitation(
     m_global_avg_pooling_kernel.setArg(1, bufferIn);
     m_global_avg_pooling_kernel.setArg(2, bufferTemp1);
 
-    m_commandqueue.enqueueNDRangeKernel(
-        m_global_avg_pooling_kernel, cl::NullRange,
-        cl::NDRange(width, batch_size * channels), cl::NDRange(width, 1));
+    if (m_opencl.m_graph_capture_enabled) {
+      auto& command_buffer = m_commandbuffers[batch_size - 1];
+      command_buffer.commandNDRangeKernel(
+          {}, m_global_avg_pooling_kernel, cl::NullRange,
+          cl::NDRange(width, batch_size * channels), cl::NDRange(width, 1));
+    } else {
+      m_commandqueue.enqueueNDRangeKernel(
+          m_global_avg_pooling_kernel, cl::NullRange,
+          cl::NDRange(width, batch_size * channels), cl::NDRange(width, 1));
+    }
   } catch (const cl::Error& e) {
     CERR << "Error in squeeze_excitation/pooling: " << e.what() << ": "
          << e.err() << std::endl;
@@ -487,9 +535,16 @@ void OpenCLBuffers::squeeze_excitation(
     m_apply_se_kernel.setArg(3, bufferResidual);
     m_apply_se_kernel.setArg(4, bufferTemp1);
 
-    m_commandqueue.enqueueNDRangeKernel(
-        m_apply_se_kernel, cl::NullRange,
-        cl::NDRange(width, batch_size * channels));
+    if (m_opencl.m_graph_capture_enabled) {
+      auto& command_buffer = m_commandbuffers[batch_size - 1];
+      command_buffer.commandNDRangeKernel(
+          {}, m_apply_se_kernel, cl::NullRange,
+          cl::NDRange(width, batch_size * channels));
+    } else {
+      m_commandqueue.enqueueNDRangeKernel(
+          m_apply_se_kernel, cl::NullRange,
+          cl::NDRange(width, batch_size * channels));
+    }
   } catch (const cl::Error& e) {
     CERR << "Error in squeeze_excitation/apply_se: " << e.what() << ": "
          << e.err() << std::endl;
@@ -538,10 +593,18 @@ void OpenCLBuffers::convolve1(int channels, int outputs,
                               cl::Local(stripSize * channelGroup * rowGroup));
     m_convolve1_kernel.setArg(4, cl::Local(rowSize));
 
-    m_commandqueue.enqueueNDRangeKernel(
-        m_convolve1_kernel, cl::NullRange,
-        cl::NDRange(channels, outputs, batch_size * rowTiles),
-        cl::NDRange(channelGroup, outputGroup, rowGroup));
+    if (m_opencl.m_graph_capture_enabled) {
+      auto& command_buffer = m_commandbuffers[batch_size - 1];
+      command_buffer.commandNDRangeKernel(
+          {}, m_convolve1_kernel, cl::NullRange,
+          cl::NDRange(channels, outputs, batch_size * rowTiles),
+          cl::NDRange(channelGroup, outputGroup, rowGroup));
+    } else {
+      m_commandqueue.enqueueNDRangeKernel(
+          m_convolve1_kernel, cl::NullRange,
+          cl::NDRange(channels, outputs, batch_size * rowTiles),
+          cl::NDRange(channelGroup, outputGroup, rowGroup));
+    }
   } catch (const cl::Error& e) {
     CERR << "Error in convolve1: " << e.what() << ": " << e.err() << std::endl;
     throw;
@@ -555,10 +618,18 @@ void OpenCLBuffers::convolve1(int channels, int outputs,
     m_merge_kernel.setArg(2, channels >> channelShift);
     m_merge_kernel.setArg(3, conv_biases[0]);
 
-    m_commandqueue.enqueueNDRangeKernel(
-        m_merge_kernel, cl::NullRange,
-        cl::NDRange(outputs, boardsize, batch_size),
-        cl::NDRange(std::min(8, outputs), 8, 1));
+    if (m_opencl.m_graph_capture_enabled) {
+      auto& command_buffer = m_commandbuffers[batch_size - 1];
+      command_buffer.commandNDRangeKernel(
+          {}, m_merge_kernel, cl::NullRange,
+          cl::NDRange(outputs, boardsize, batch_size),
+          cl::NDRange(std::min(8, outputs), 8, 1));
+    } else {
+      m_commandqueue.enqueueNDRangeKernel(
+          m_merge_kernel, cl::NullRange,
+          cl::NDRange(outputs, boardsize, batch_size),
+          cl::NDRange(std::min(8, outputs), 8, 1));
+    }
   } catch (const cl::Error& e) {
     CERR << "Error in merge: " << e.what() << ": " << e.err() << std::endl;
     throw;
@@ -591,9 +662,16 @@ void OpenCLBuffers::innerproduct(cl::Buffer& input, weight_slice_t weights,
     m_sgemv_kernel.setArg(9, biases[0]);
     m_sgemv_kernel.setArg(10, static_cast<int>(relu));
 
-    m_commandqueue.enqueueNDRangeKernel(m_sgemv_kernel, cl::NullRange,
-                                        cl::NDRange(global_size, batch_size),
-                                        cl::NDRange(local_size, 1));
+    if (m_opencl.m_graph_capture_enabled) {
+      auto& command_buffer = m_commandbuffers[batch_size - 1];
+      command_buffer.commandNDRangeKernel({}, m_sgemv_kernel, cl::NullRange,
+                                          cl::NDRange(global_size, batch_size),
+                                          cl::NDRange(local_size, 1));
+    } else {
+      m_commandqueue.enqueueNDRangeKernel(m_sgemv_kernel, cl::NullRange,
+                                          cl::NDRange(global_size, batch_size),
+                                          cl::NDRange(local_size, 1));
+    }
   } catch (const cl::Error& e) {
     CERR << "Error in innerproduct: " << e.what() << ": " << e.err()
          << std::endl;
@@ -613,10 +691,23 @@ void OpenCLBuffers::policymap(int N, const cl::Buffer& input,
     m_policymap_kernel.setArg(5, usedSize);
     m_policymap_kernel.setArg(6, outputSize);
 
-    m_commandqueue.enqueueNDRangeKernel(m_policymap_kernel, cl::NullRange,
-                                        cl::NDRange(N * usedSize));
+    if (m_opencl.m_graph_capture_enabled) {
+      auto& command_buffer = m_commandbuffers[N - 1];
+      command_buffer.commandNDRangeKernel({}, m_policymap_kernel, cl::NullRange,
+                                          cl::NDRange(N * usedSize));
+    } else {
+      m_commandqueue.enqueueNDRangeKernel(m_policymap_kernel, cl::NullRange,
+                                          cl::NDRange(N * usedSize));
+    }
   } catch (const cl::Error& e) {
     CERR << "Error in policymap: " << e.what() << ": " << e.err() << std::endl;
     throw;
   }
+}
+
+void OpenCLBuffers::finalizeGraph() {
+  for (auto& cb : m_commandbuffers) {
+    cb.finalizeCommandBuffer();
+  }
+  m_graph_finalized = true;
 }
