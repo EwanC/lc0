@@ -21,6 +21,8 @@
 
 #include "neural/backends/opencl/OpenCLBuffers.h"
 
+#include "cl_ext_command_buffer_dot_print.h"
+
 OpenCLBuffers::OpenCLBuffers(const OpenCL_Network& opencl_net)
     : m_opencl_net(opencl_net), m_opencl(opencl_net.getOpenCL()) {
   auto& program = m_opencl.m_program;
@@ -706,8 +708,41 @@ void OpenCLBuffers::policymap(int N, const cl::Buffer& input,
 }
 
 void OpenCLBuffers::finalizeGraph() {
+#if !defined(NDEBUG) and defined(cl_ext_command_buffer_dot_print)
+  bool has_dot_cmd_buf_ext =
+      m_opencl.m_device.getInfo<CL_DEVICE_EXTENSIONS>().find(
+          CL_EXT_COMMAND_BUFFER_DOT_PRINT_NAME) != std::string::npos;
+  clDotPrintCommandBufferEXT_fn clDotPrintCommandBufferEXT = nullptr;
+
+  if (has_dot_cmd_buf_ext) {
+    auto platform = m_opencl.m_device.getInfo<CL_DEVICE_PLATFORM>();
+    clDotPrintCommandBufferEXT =
+        reinterpret_cast<clDotPrintCommandBufferEXT_fn>(
+            clGetExtensionFunctionAddressForPlatform(
+                platform(), "clDotPrintCommandBufferEXT"));
+    assert(nullptr != clDotPrintCommandBufferEXT);
+  }
+  cl_command_buffer_dot_print_flags_ext flags =
+      CL_COMMAND_BUFFER_DOT_PRINT_VERBOSE_EXT;
+  cl_command_buffer_dot_print_properties_ext props[3] = {
+      CL_COMMAND_BUFFER_DOT_PRINT_FLAGS_EXT, flags, 0};
+  unsigned batch_idx = 0;
+#endif
+
   for (auto& cb : m_commandbuffers) {
     cb.finalizeCommandBuffer();
+
+#if !defined(NDEBUG) and defined(cl_ext_command_buffer_dot_print)
+    if (has_dot_cmd_buf_ext) {
+      std::string dot_filename("graph_");
+      dot_filename.append(std::to_string(batch_idx)).append(".dot");
+      batch_idx++;
+      cl_int err =
+          clDotPrintCommandBufferEXT(cb.get(), props, dot_filename.c_str());
+      assert(err == CL_SUCCESS);
+    }
+#endif
   }
+
   m_graph_finalized = true;
 }
