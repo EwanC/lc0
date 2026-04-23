@@ -101,11 +101,6 @@ class OpenCLComputation : public NetworkComputation {
 
     for (size_t i = 0; i < plane_count; i += largest_batch_size) {
       const auto batch_size = std::min(plane_count - i, largest_batch_size);
-
-      for (size_t j = 0; j < batch_size; j++) {
-        EncodePlanes(planes_[i + j], &input_data[j * kSquares * kInputPlanes]);
-      }
-
       buffers_->forward(input_data, output_pol, output_val, output_mov,
                         batch_size);
     }
